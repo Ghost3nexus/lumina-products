@@ -216,42 +216,31 @@ function dataUrlToBase64(dataUrl: string): string {
   return c >= 0 ? dataUrl.slice(c + 1) : dataUrl;
 }
 
-export async function processSKU(
+export { fileToBase64, dataUrlToBase64 };
+
+export async function analyzePair(engine: ButsudoriEngine, pair: SKUPair): Promise<GarmentAnalysis> {
+  const [frontB64, backB64] = await Promise.all([fileToBase64(pair.frontFile), fileToBase64(pair.backFile)]);
+  return engine.analyze(frontB64, backB64);
+}
+
+export async function generateForSKU(
   engine: ButsudoriEngine,
   pair: SKUPair,
+  analysis: GarmentAnalysis,
   mode: OutputMode,
   onUpdate: (partial: Partial<SKUResult>) => void,
 ): Promise<SKUResult> {
-  const result: SKUResult = {
-    pair,
-    status: 'analyzing',
-    progress: 0,
-    outputs: {},
-    startedAt: Date.now(),
-  };
-  onUpdate({ status: 'analyzing', progress: 5, message: '解析中…' });
+  const result: SKUResult = { pair, status: 'generating', progress: 15, outputs: {}, analysis, startedAt: Date.now() };
+  onUpdate({ status: 'generating', progress: 15, message: '生成開始', analysis });
 
   try {
-    const [frontB64, backB64] = await Promise.all([
-      fileToBase64(pair.frontFile),
-      fileToBase64(pair.backFile),
-    ]);
-
-    const analysis = await engine.analyze(frontB64, backB64);
-    result.analysis = analysis;
-    onUpdate({ analysis, progress: 15, message: '解析完了 / 生成開始' });
+    const [frontB64, backB64] = await Promise.all([fileToBase64(pair.frontFile), fileToBase64(pair.backFile)]);
 
     const wantGM = mode === 'ghost-mannequin' || mode === 'both';
     const wantFL = mode === 'flatlay' || mode === 'both';
-
-    let totalSteps = (wantGM ? 4 : 0) + (wantFL ? 2 : 0);
+    const totalSteps = (wantGM ? 4 : 0) + (wantFL ? 2 : 0);
     let stepsDone = 0;
-    const tickProgress = () => {
-      stepsDone++;
-      onUpdate({ progress: 15 + Math.round((stepsDone / totalSteps) * 80) });
-    };
-
-    onUpdate({ status: 'generating' });
+    const tick = () => { stepsDone++; onUpdate({ progress: 15 + Math.round((stepsDone / totalSteps) * 80) }); };
 
     if (wantGM) {
       for (const view of ['front', 'back', 'side', 'detail'] as const) {
@@ -259,9 +248,9 @@ export async function processSKU(
         if (out) {
           const key = ('gm' + view.charAt(0).toUpperCase() + view.slice(1)) as 'gmFront'|'gmBack'|'gmSide'|'gmDetail';
           result.outputs[key] = out;
-          onUpdate({ outputs: { ...result.outputs }, message: `${view} 生成完了` });
+          onUpdate({ outputs: { ...result.outputs }, message: `${view} 完了` });
         }
-        tickProgress();
+        tick();
       }
     }
 
@@ -271,7 +260,7 @@ export async function processSKU(
         result.outputs.flatlayFront = flFront;
         onUpdate({ outputs: { ...result.outputs }, message: 'flat-lay front 完了' });
       }
-      tickProgress();
+      tick();
       if (flFront) {
         const flBack = await engine.genFlatlayBack(analysis, dataUrlToBase64(flFront), backB64);
         if (flBack) {
@@ -279,25 +268,55 @@ export async function processSKU(
           onUpdate({ outputs: { ...result.outputs }, message: 'flat-lay back 完了' });
         }
       }
-      tickProgress();
+      tick();
     }
 
-    result.status = 'done';
-    result.progress = 100;
-    result.finishedAt = Date.now();
+    result.status = 'done'; result.progress = 100; result.finishedAt = Date.now();
     onUpdate({ status: 'done', progress: 100, message: '完了', finishedAt: result.finishedAt });
   } catch (e: any) {
-    result.status = 'error';
-    result.error = e?.message || String(e);
-    result.finishedAt = Date.now();
+    result.status = 'error'; result.error = e?.message || String(e); result.finishedAt = Date.now();
     onUpdate({ status: 'error', error: result.error, finishedAt: result.finishedAt });
   }
   return result;
 }
 
-export async function runBatch(
+/** Run analyze across pairs with concurrency. Calls onAnalyzed per SKU as ready. */
+export async function batchAnalyze(
   apiKey: string,
   pairs: SKUPair[],
+  concurrency: number,
+  onAnalyzed: (skuId: string, analysis: GarmentAnalysis | null, error?: string) => void,
+): Promise<void> {
+  const engine = new ButsudoriEngine(apiKey);
+  const queue = [...pairs];
+  const inFlight = new Set<Promise<void>>();
+
+  const next = async () => {
+    while (queue.length || inFlight.size) {
+      while (queue.length && inFlight.size < concurrency) {
+        const p = queue.shift()!;
+        const task = (async () => {
+          try {
+            const a = await analyzePair(engine, p);
+            onAnalyzed(p.id, a);
+          } catch (e: any) {
+            onAnalyzed(p.id, null, e?.message || String(e));
+          }
+        })();
+        const wrap = task.finally(() => inFlight.delete(wrap));
+        inFlight.add(wrap);
+      }
+      if (inFlight.size) await Promise.race(inFlight);
+    }
+  };
+  await next();
+}
+
+/** Run generation across pairs using pre-computed (possibly edited) analyses. */
+export async function batchGenerate(
+  apiKey: string,
+  pairs: SKUPair[],
+  analyses: Record<string, GarmentAnalysis>,
   mode: OutputMode,
   concurrency: number,
   onUpdate: (skuId: string, partial: Partial<SKUResult>) => void,
@@ -310,8 +329,13 @@ export async function runBatch(
     while (queue.length || inFlight.size) {
       while (queue.length && inFlight.size < concurrency) {
         const p = queue.shift()!;
+        const a = analyses[p.id];
+        if (!a) {
+          onUpdate(p.id, { status: 'error', error: '解析データなし — analyze を先に実行してください' });
+          continue;
+        }
         const task = (async () => {
-          await processSKU(engine, p, mode, partial => onUpdate(p.id, partial));
+          await generateForSKU(engine, p, a, mode, partial => onUpdate(p.id, partial));
         })();
         const wrap = task.finally(() => inFlight.delete(wrap));
         inFlight.add(wrap);
